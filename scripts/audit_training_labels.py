@@ -30,6 +30,9 @@ WORKSPACE_MARKERS = (
 )
 
 RELATIVE_PATH_PATTERN = re.compile(r"(?:^|[\s'\"`：:])(?:[a-zA-Z0-9_-]+/)+[a-zA-Z0-9_.-]+")
+QUOTED_CONTENT_REPLACEMENT = re.compile(r"内容替换为\s*['\"][^'\"]+['\"]")
+RELATIVE_FILE_PATTERN = re.compile(r"(?<![/\w])(?:\./)?(?:[A-Za-z0-9_.-]+/)*[A-Za-z0-9_.-]+\.[A-Za-z0-9]+")
+ABSOLUTE_PATH_MARKERS = ("/etc/", "/var/", "/tmp/", "/home/", "/workspace/", "/src/")
 
 
 def assistant_reason(row: dict[str, Any]) -> str:
@@ -62,6 +65,15 @@ def looks_like_explicit_workspace_write(row: dict[str, Any]) -> bool:
     return any(marker.lower() in text for marker in WORKSPACE_MARKERS) or bool(RELATIVE_PATH_PATTERN.search(text))
 
 
+def looks_like_quoted_content_replacement(row: dict[str, Any]) -> bool:
+    text = user_content(row)
+    if not QUOTED_CONTENT_REPLACEMENT.search(text):
+        return False
+    if any(marker in text for marker in ABSOLUTE_PATH_MARKERS):
+        return False
+    return bool(RELATIVE_FILE_PATTERN.search(text)) or any(marker in text for marker in WORKSPACE_MARKERS)
+
+
 def is_schema_denial(row: dict[str, Any]) -> bool:
     return action_from_assistant_content(assistant_content(row)) == "DENY_AND_LEDGER" and assistant_reason(row) == "schema_out_of_contract"
 
@@ -75,7 +87,9 @@ def audit_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
             "gold_reason": assistant_reason(row),
         }
         for row in rows
-        if is_schema_denial(row) and looks_like_explicit_workspace_write(row)
+        if is_schema_denial(row) and (
+            looks_like_explicit_workspace_write(row) or looks_like_quoted_content_replacement(row)
+        )
     ]
     return {
         "sample_count": len(rows),

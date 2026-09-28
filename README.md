@@ -35,6 +35,10 @@ YiZiJue-LM is not:
 - a from-scratch foundation model;
 - a replacement for OneCode policy enforcement.
 
+## 2026-09-28
+
+决策现在在生成之前完成。规则能决定的请求直接返回。其余请求由冻结的坍缩头给出动作，允许类再补路径和 SHA256，补不上就拒绝。更新说明见 [CHANGELOG.md](CHANGELOG.md)。
+
 ## Release Artifact
 
 The v0.1 release provides a LoRA adapter package:

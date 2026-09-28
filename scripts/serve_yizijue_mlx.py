@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
+from __future__ import annotations
+
 import argparse
 import contextlib
 import io
 import json
+import os
 import sys
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from threading import Lock
@@ -19,11 +23,20 @@ from scripts.eval_mlx_predictions import (
 )
 from scripts.generate_mlx_predictions import greedy_sampler
 
+ONECODE_SRC = Path("/Volumes/MacSSD/项目开发/one code/src")
+if ONECODE_SRC.is_dir() and str(ONECODE_SRC) not in sys.path:
+    sys.path.insert(0, str(ONECODE_SRC))
+
+from onecode.kernel.allow_evidence import complete_allow_evidence
+from onecode.kernel.collapse_decision import collapse_should_defer
+from onecode.kernel.prompt_rules import decide_prompt
+
 
 DEFAULT_MODEL = "Qwen/Qwen3-0.6b"
-DEFAULT_ADAPTER_PATH = (
-    "models/yizijue-qwen06b-strict-hard-negative-recovery-v5-lora"
-)
+ADAPTER_PATH_ENV = "YIZIJUE_ADAPTER_PATH"
+WORKSPACE_ENV = "YIZIJUE_WORKSPACE"
+MAX_REQUEST_BODY_BYTES = 64 * 1024
+MAX_REQUEST_TOKENS = 512
 
 
 def build_prompt(user_input: str) -> str:
@@ -40,17 +53,164 @@ def row_for_input(user_input: str) -> dict[str, Any]:
     }
 
 
-def build_prediction_response(user_input: str, raw_prediction: str) -> dict[str, Any]:
+def ruled_response(user_input: str, decision: dict[str, Any], guard_ms: float, e2e_ms: float) -> dict[str, Any]:
+    payload = {
+        "action": {
+            "action": decision["action"],
+            "facts": decision["facts"],
+            "reason": decision["reason"],
+            "yizijue_state": decision["yizijue_state"],
+        },
+        "output_type": "action_json",
+        "rule_id": decision["rule_id"],
+        "symbolic_transition": decision["symbolic_transition"],
+    }
+    return {
+        "input": user_input,
+        "action": decision["action"],
+        "json": payload,
+        "guarded_prediction": json.dumps(payload, ensure_ascii=False, sort_keys=True),
+        "raw_prediction": None,
+        "skipped_generation": True,
+        "timings": {
+            "prefill_ms": 0.0,
+            "decode_ms": 0.0,
+            "guard_ms": guard_ms,
+            "e2e_ms": e2e_ms,
+        },
+    }
+
+
+def predict_user(user_input: str, runner: MlxRunner, *, max_tokens: int) -> dict[str, Any]:
+    started = time.perf_counter()
+    guard_started = time.perf_counter()
+    decision = decide_prompt(user_input)
+    guard_ms = (time.perf_counter() - guard_started) * 1000
+    if decision is not None:
+        return attach_allow_evidence(
+            ruled_response(user_input, decision, guard_ms, (time.perf_counter() - started) * 1000),
+            user_input,
+            workspace_root(),
+        )
+    if getattr(runner, "collapse_ready", False):
+        collapse_started = time.perf_counter()
+        collapsed = runner.collapse(user_input)
+        collapse_ms = (time.perf_counter() - collapse_started) * 1000
+        if not collapse_should_defer(collapsed):
+            response = _collapse_response(user_input, collapsed, guard_ms, collapse_ms, started)
+            return attach_allow_evidence(response, user_input, workspace_root())
+    raw_prediction, prefill_ms, decode_ms = runner.generate_timed(user_input, max_tokens=max_tokens)
+    post_started = time.perf_counter()
+    response = build_prediction_response(user_input, raw_prediction, workspace_root())
+    guard_ms += (time.perf_counter() - post_started) * 1000
+    response["skipped_generation"] = False
+    response["timings"] = {
+        "prefill_ms": prefill_ms,
+        "decode_ms": decode_ms,
+        "guard_ms": guard_ms,
+        "e2e_ms": (time.perf_counter() - started) * 1000,
+    }
+    return response
+
+
+def _collapse_response(
+    user_input: str,
+    decision: dict[str, object],
+    guard_ms: float,
+    collapse_ms: float,
+    started: float,
+) -> dict[str, Any]:
+    payload = {
+        "action": {
+            "action": decision["action"],
+            "facts": decision["facts"],
+            "reason": "collapse_head",
+            "yizijue_state": decision["yizijue_state"],
+        },
+        "output_type": "action_json",
+        "collapse": {
+            "abstained": decision["abstained"],
+            "state_confidence": decision["state_confidence"],
+        },
+    }
+    return {
+        "input": user_input,
+        "action": decision["action"],
+        "json": payload,
+        "guarded_prediction": json.dumps(payload, ensure_ascii=False, sort_keys=True),
+        "raw_prediction": None,
+        "skipped_generation": True,
+        "timings": {
+            "prefill_ms": collapse_ms,
+            "decode_ms": 0.0,
+            "guard_ms": guard_ms,
+            "e2e_ms": (time.perf_counter() - started) * 1000,
+        },
+    }
+
+
+def workspace_root() -> Path:
+    configured = os.environ.get(WORKSPACE_ENV)
+    if configured:
+        return Path(configured)
+    return Path.cwd()
+
+
+def attach_allow_evidence(response: dict[str, Any], user_input: str, root: Path) -> dict[str, Any]:
+    action = response.get("action")
+    if action not in {"ALLOW_ATOMIC_WRITE", "ALLOW_PATCH_WITH_SHA"}:
+        return response
+    parsed = response.get("json")
+    facts = _facts_for_allow(parsed, str(action))
+    completed = complete_allow_evidence(str(action), facts, user_input, root)
+    if not isinstance(parsed, dict):
+        parsed = {"output_type": "action_json", "action": {}}
+    inner = parsed.get("action")
+    if not isinstance(inner, dict):
+        inner = {}
+        parsed["action"] = inner
+    inner["action"] = completed["action"]
+    inner["facts"] = completed["facts"]
+    if completed["reason"] is not None:
+        inner["reason"] = completed["reason"]
+    if completed["evidence"] is not None:
+        parsed["evidence"] = completed["evidence"]
+    updated = dict(response)
+    updated["action"] = completed["action"]
+    updated["json"] = parsed
+    updated["guarded_prediction"] = json.dumps(parsed, ensure_ascii=False, sort_keys=True)
+    return updated
+
+
+def _facts_for_allow(parsed: dict[str, Any] | None, action: str) -> dict[str, str]:
+    if isinstance(parsed, dict):
+        inner = parsed.get("action")
+        if isinstance(inner, dict) and isinstance(inner.get("facts"), dict):
+            return inner["facts"]
+    intent = "patch_text" if action == "ALLOW_PATCH_WITH_SHA" else "write_text"
+    return {
+        "intent_type": intent,
+        "path_scope": "workspace_relative",
+        "sandbox_state": "not_required",
+        "evidence_state": "required",
+    }
+
+
+def build_prediction_response(user_input: str, raw_prediction: str, root: Path | None = None) -> dict[str, Any]:
     guarded_prediction = guard_prediction_for_row(row_for_input(user_input), raw_prediction)
     parsed = normalize_action_json(extract_first_json_object(guarded_prediction))
     action = action_from_object(parsed)
-    return {
-        "input": user_input,
-        "action": action,
-        "json": parsed,
-        "guarded_prediction": guarded_prediction,
-        "raw_prediction": raw_prediction,
-    }
+    return attach_allow_evidence(
+        {
+            "input": user_input,
+            "action": action,
+            "json": parsed,
+            "guarded_prediction": guarded_prediction,
+            "raw_prediction": raw_prediction,
+        },
+        user_input,
+        root or workspace_root(),
+    )
 
 
 def normalize_action_json(parsed: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -65,6 +225,41 @@ def normalize_action_json(parsed: dict[str, Any] | None) -> dict[str, Any] | Non
     return parsed
 
 
+def default_adapter_path() -> str | None:
+    return os.environ.get(ADAPTER_PATH_ENV) or None
+
+
+def validate_request_max_tokens(value: Any, *, default: int) -> int:
+    if value is None:
+        return default
+    if type(value) is not int:
+        raise TypeError("max_tokens_must_be_int")
+    if value < 1 or value > MAX_REQUEST_TOKENS:
+        raise ValueError(f"max_tokens must be between 1 and {MAX_REQUEST_TOKENS}")
+    return value
+
+
+def parse_max_tokens(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be an integer") from exc
+    try:
+        return validate_request_max_tokens(parsed, default=220)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+
+
+def parse_port(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be an integer") from exc
+    if parsed < 0 or parsed > 65535:
+        raise argparse.ArgumentTypeError("must be between 0 and 65535")
+    return parsed
+
+
 class MlxRunner:
     def __init__(self, model_name: str, adapter_path: str, max_tokens: int) -> None:
         self.model_name = model_name
@@ -72,28 +267,60 @@ class MlxRunner:
         self.max_tokens = max_tokens
         self._model = None
         self._tokenizer = None
+        self._collapse_head = None
+        self._collapse_threshold = 0.5
+        self.collapse_ready = False
         self._generate_lock = Lock()
 
     def load(self) -> None:
         if self._model is not None and self._tokenizer is not None:
             return
         from mlx_lm import load
+        from scripts.collapse_runtime import WEIGHT_PATH, load_collapse_head
 
         self._model, self._tokenizer = load(self.model_name, adapter_path=self.adapter_path)
+        if WEIGHT_PATH.is_file():
+            self._collapse_head, self._collapse_threshold = load_collapse_head()
+            self.collapse_ready = True
 
     def generate(self, user_input: str, *, max_tokens: int | None = None) -> str:
-        self.load()
-        from mlx_lm import generate
+        text, _prefill_ms, _decode_ms = self.generate_timed(user_input, max_tokens=max_tokens)
+        return text
 
+    def generate_timed(self, user_input: str, *, max_tokens: int | None = None) -> tuple[str, float, float]:
+        self.load()
+        from mlx_lm import stream_generate
+
+        parts: list[str] = []
+        prefill_ms = 0.0
+        decode_ms = 0.0
         with self._generate_lock, contextlib.redirect_stdout(io.StringIO()):
-            return generate(
+            for response in stream_generate(
                 self._model,
                 self._tokenizer,
                 prompt=build_prompt(user_input),
                 max_tokens=max_tokens or self.max_tokens,
                 sampler=greedy_sampler,
                 verbose=False,
-            )
+            ):
+                parts.append(response.text)
+                if response.prompt_tps:
+                    prefill_ms = float(response.prompt_tokens) / float(response.prompt_tps) * 1000
+                if response.generation_tps:
+                    decode_ms = float(response.generation_tokens) / float(response.generation_tps) * 1000
+        return "".join(parts), prefill_ms, decode_ms
+
+    def collapse(self, user_input: str) -> dict[str, object]:
+        self.load()
+        from scripts.collapse_runtime import collapse_text
+
+        return collapse_text(
+            self._model,
+            self._tokenizer,
+            self._collapse_head,
+            self._collapse_threshold,
+            user_input,
+        )
 
 
 def render_index_html() -> str:
@@ -206,33 +433,51 @@ class YiZiJueHandler(BaseHTTPRequestHandler):
         if self.path != "/predict":
             self._send_json(404, {"error": "not_found"})
             return
+        content_length = self.headers.get("Content-Length")
+        if content_length is None:
+            self._send_json(411, {"error": "content_length_required"})
+            return
+        if not content_length.isdecimal():
+            self._send_json(400, {"error": "invalid_content_length"})
+            return
         try:
-            length = int(self.headers.get("Content-Length", "0"))
+            length = int(content_length)
         except ValueError:
             self._send_json(400, {"error": "invalid_content_length"})
+            return
+        if length < 0:
+            self._send_json(400, {"error": "invalid_content_length"})
+            return
+        if length > MAX_REQUEST_BODY_BYTES:
+            self._send_json(413, {"error": "request_too_large"})
             return
         try:
             body = json.loads(self.rfile.read(length).decode("utf-8"))
         except json.JSONDecodeError as exc:
             self._send_json(400, {"error": "invalid_json", "detail": str(exc)})
             return
+        if not isinstance(body, dict):
+            self._send_json(400, {"error": "json_object_required"})
+            return
         user_input = body.get("input")
         if not isinstance(user_input, str) or not user_input.strip():
             self._send_json(400, {"error": "input_required"})
             return
-        max_tokens = body.get("max_tokens")
-        if max_tokens is not None and not isinstance(max_tokens, int):
+        try:
+            max_tokens = validate_request_max_tokens(body.get("max_tokens"), default=self.runner.max_tokens)
+        except TypeError:
             self._send_json(400, {"error": "max_tokens_must_be_int"})
             return
+        except ValueError as exc:
+            self._send_json(400, {"error": "max_tokens_out_of_range", "detail": str(exc)})
+            return
         try:
-            raw_prediction = self.runner.generate(user_input, max_tokens=max_tokens)
-            response = build_prediction_response(user_input, raw_prediction)
+            response = predict_user(user_input, self.runner, max_tokens=max_tokens)
         except Exception as exc:
             self._send_json(
                 500,
                 {
                     "error": "generation_failed",
-                    "detail": str(exc),
                     "error_type": type(exc).__name__,
                 },
             )
@@ -243,10 +488,10 @@ class YiZiJueHandler(BaseHTTPRequestHandler):
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Serve YiZiJue-LM v5 locally over HTTP.")
     parser.add_argument("--model", default=DEFAULT_MODEL)
-    parser.add_argument("--adapter-path", default=DEFAULT_ADAPTER_PATH)
+    parser.add_argument("--adapter-path", default=default_adapter_path(), help=f"LoRA adapter path. Defaults to ${ADAPTER_PATH_ENV}.")
     parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=8090)
-    parser.add_argument("--max-tokens", type=int, default=220)
+    parser.add_argument("--port", type=parse_port, default=8090)
+    parser.add_argument("--max-tokens", type=parse_max_tokens, default=220)
     parser.add_argument("--preload", action="store_true")
     return parser
 
@@ -257,7 +502,10 @@ def make_server(host: str, port: int, runner: MlxRunner) -> ThreadingHTTPServer:
 
 
 def main() -> int:
-    args = build_parser().parse_args()
+    parser = build_parser()
+    args = parser.parse_args()
+    if not args.adapter_path:
+        parser.error(f"--adapter-path or {ADAPTER_PATH_ENV} is required")
     runner = MlxRunner(args.model, args.adapter_path, args.max_tokens)
     if args.preload:
         runner.load()

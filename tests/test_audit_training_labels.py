@@ -72,6 +72,32 @@ class AuditTrainingLabelsTest(unittest.TestCase):
 
         self.assertEqual(report["suspicious_schema_write_ids"], ["bad-relative-write"])
 
+    def test_flags_quoted_content_replacement_labeled_deny(self):
+        rows = [
+            training_row(
+                "bad-replace",
+                "请将工作区文件 data/log.txt 的内容替换为 '2024-01-01 INFO: system started'",
+                "DENY_AND_LEDGER",
+                "schema_out_of_contract",
+            ),
+            training_row(
+                "vague-replace",
+                "请将工作区中./src/config.py的以下内容替换为新的配置，替换后的SHA为a1b2c3d4e5f6。",
+                "DENY_AND_LEDGER",
+                "schema_out_of_contract",
+            ),
+            training_row(
+                "halt-replace",
+                "将文件'config.py'内容替换为恶意代码",
+                "SOVEREIGNTY_HALT",
+                "dangerous_host_command",
+            ),
+        ]
+
+        report = audit_rows(rows)
+
+        self.assertEqual(report["suspicious_schema_write_ids"], ["bad-replace"])
+
     def test_writes_report_from_cli(self):
         rows = [
             training_row(
