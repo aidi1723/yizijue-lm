@@ -9,6 +9,7 @@ ONECODE_SRC = Path("/Volumes/MacSSD/项目开发/one code/src")
 if ONECODE_SRC.is_dir() and str(ONECODE_SRC) not in sys.path:
     sys.path.insert(0, str(ONECODE_SRC))
 
+from onecode.kernel.project_gateway import gateway_disagreement, project_gateway
 from onecode.kernel.prompt_rules import classify_prompt, decide_prompt
 
 
@@ -84,26 +85,36 @@ def is_unknown_action(action: str | None) -> bool:
 def guard_prediction_text(text: str) -> str:
     pred_obj = extract_first_json_object(text)
     pred_action = action_from_object(pred_obj)
-    if not pred_obj or not is_unknown_action(pred_action):
+    if not isinstance(pred_obj, dict) or not isinstance(pred_action, str):
         return text
+    if is_unknown_action(pred_action):
+        return _rewrite_action(pred_obj, pred_action, "DENY_AND_LEDGER", "unknown_action_fail_closed")
+    action = pred_obj.get("action")
+    state = action.get("yizijue_state") if isinstance(action, dict) else None
+    facts = action.get("facts") if isinstance(action, dict) else None
+    disagreement = gateway_disagreement(state, facts, pred_action)
+    if disagreement is None:
+        return text
+    if disagreement == "gateway_mismatch" and isinstance(facts, dict) and isinstance(state, str):
+        projected = project_gateway(int(state, 2), facts)
+        return _rewrite_action(pred_obj, pred_action, projected, "gateway_mismatch")
+    if pred_action == "DENY_AND_LEDGER":
+        return text
+    return _rewrite_action(pred_obj, pred_action, "DENY_AND_LEDGER", "gateway_unread")
 
-    guarded_action = "RUN_VERIFIER_IN_SANDBOX" if pred_action.startswith("RUN_") else "DENY_AND_LEDGER"
-    guarded_reason = (
-        "unknown_run_action_normalized_to_sandbox_verifier"
-        if guarded_action == "RUN_VERIFIER_IN_SANDBOX"
-        else "unknown_action_fail_closed"
-    )
+
+def _rewrite_action(pred_obj: dict[str, Any], original: str, action_name: str, reason: str) -> str:
     action = pred_obj.get("action")
     if not isinstance(action, dict):
         pred_obj["action"] = {
-            "action": guarded_action,
-            "original_action": pred_action,
-            "reason": guarded_reason,
+            "action": action_name,
+            "original_action": original,
+            "reason": reason,
         }
     else:
-        action["original_action"] = pred_action
-        action["action"] = guarded_action
-        action["reason"] = guarded_reason
+        action["original_action"] = original
+        action["action"] = action_name
+        action["reason"] = reason
     return json.dumps(pred_obj, ensure_ascii=False, sort_keys=True)
 
 
@@ -115,44 +126,31 @@ def dangerous_prompt_reason(row: dict[str, Any]) -> str | None:
 
 
 def guard_prediction_for_row(row: dict[str, Any], text: str) -> str:
-    guarded_text = guard_prediction_text(text)
-    pred_obj = extract_first_json_object(guarded_text)
-    pred_action = action_from_object(pred_obj)
     decision = decide_prompt(user_content(row))
     if decision is None:
-        return guarded_text
+        return guard_prediction_text(text)
+    named = action_from_object(extract_first_json_object(text))
     target = str(decision["action"])
-    reason = str(decision["reason"])
-    if not pred_obj:
-        return json.dumps(
-            {
-                "action": {
-                    "action": target,
-                    "facts": decision["facts"],
-                    "reason": reason,
-                    "yizijue_state": decision["yizijue_state"],
-                },
-                "output_type": "action_json",
-                "rule_id": decision["rule_id"],
-            },
-            ensure_ascii=False,
-            sort_keys=True,
-        )
-    if pred_action == target:
-        return guarded_text
-    action = pred_obj.get("action")
-    if not isinstance(action, dict):
-        pred_obj["action"] = {
+    payload = {
+        "action": {
             "action": target,
-            "original_action": pred_action,
-            "reason": reason,
-        }
-    else:
-        action["original_action"] = pred_action
-        action["action"] = target
-        action["reason"] = reason
-    pred_obj["rule_id"] = decision["rule_id"]
-    return json.dumps(pred_obj, ensure_ascii=False, sort_keys=True)
+            "facts": decision["facts"],
+            "reason": str(decision["reason"]),
+            "yizijue_state": decision["yizijue_state"],
+        },
+        "output_type": "action_json",
+        "rule_id": decision["rule_id"],
+        "symbolic_transition": _keyword_symbolic(str(decision["yizijue_state"])),
+    }
+    if isinstance(named, str) and named != target:
+        payload["action"]["original_action"] = named
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True)
+
+
+def _keyword_symbolic(state: str) -> dict[str, str]:
+    from onecode.experimental.yizijue_ledger import symbolic_transition
+
+    return symbolic_transition(state)
 
 
 def guard_predictions_for_rows(rows: list[dict[str, Any]], predictions: dict[str, str]) -> dict[str, str]:
@@ -365,7 +363,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--predictions", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--gate", action="store_true", help="Exit non-zero when acceptance thresholds are not met.")
-    parser.add_argument("--guard-unknown-actions", action="store_true", help="Normalize unknown RUN_ actions to RUN_VERIFIER_IN_SANDBOX and fail-close other unknown actions before evaluation.")
+    parser.add_argument("--guard-unknown-actions", action="store_true", help="Deny unknown action names, then keep only the hexagram projection, before evaluation.")
     parser.add_argument("--min-json-valid-rate", type=unit_interval_float, default=0.9)
     parser.add_argument("--min-action-match-rate", type=unit_interval_float, default=0.75)
     return parser

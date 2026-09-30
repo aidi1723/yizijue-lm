@@ -1,0 +1,58 @@
+{
+  "closed_on": "2026-09-30",
+  "status": "closed",
+  "base": "Qwen3-0.6B frozen",
+  "lora": "v5 frozen",
+  "served_head": "yizijue-reviewed-coverage-head.npz",
+  "served_temperature": 1.0,
+  "pooling": "mean",
+  "gates": {
+    "source": "logs/2026-09-30-reviewed-coverage-retrain.json",
+    "real_test": {"count": 300, "state_accuracy": 0.9833333333333333, "halt_recall": 0.9861111111111112, "unsafe_allow_count": 0, "state_ece": 0.016262090802192763},
+    "coverage_test": {"count": 480, "state_accuracy": 1.0, "macro_recall": 1.0, "min_recall": 1.0, "unsafe_allow_count": 0},
+    "original_212": {"count": 212, "state_accuracy": 0.9716981132075472, "halt_recall": 0.9938271604938271, "unsafe_allow_count": 0},
+    "gate_passed": true,
+    "wired_into_service": true
+  },
+  "temperature_fit": {
+    "source": "logs/2026-09-30-temperature-fit.json",
+    "weights_changed": false,
+    "promoted": false,
+    "served_temperature": 1.0
+  },
+  "moving_head": {
+    "source": "logs/2026-09-30-phase4-paraphrase-report.json",
+    "heldout_line_accuracy": 0.9947916666666666,
+    "heldout_before_accuracy": 1.0,
+    "heldout_after_accuracy": 0.96875,
+    "outside_sixty_four": 0,
+    "action_head_unchanged": true
+  },
+  "virtue_review": {
+    "source": "logs/2026-09-30-hexagram-virtue-review.json",
+    "hexagrams": 60,
+    "failures": 0,
+    "unpinned_gateway": "DENY_AND_LEDGER"
+  },
+  "verifier_gate": {
+    "source": "logs/2026-09-30-original212-verifier-gate.json",
+    "verifier_gold": 27,
+    "keyword_halt_on_dangerous_verifier_gold": 21,
+    "plain_verifier_gold": 6,
+    "plain_verifier_head_halt": 0,
+    "relabel": false
+  },
+  "closed_without_training": [
+    "ordinary prose has no 6/7/8/9 gold; moving head stays on explicit line values",
+    "a review may only name a hexagram; no second model proposes a recast",
+    "original-212 gold/rule conflicts stay unlabeled and are not retrained toward verifier gold"
+  ],
+  "execution": {
+    "default_runs_verifier": false,
+    "default_runs_write": false,
+    "invalid_admission": "yizijue_admission_rejected",
+    "copied_ledger_line": "rejected when kind is already set",
+    "ledgers": "workspace and YIZIJUE_LEDGER receive the same decision, rejection, and effect",
+    "committed": false
+  }
+}

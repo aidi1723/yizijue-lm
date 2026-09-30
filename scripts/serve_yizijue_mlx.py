@@ -29,6 +29,7 @@ if ONECODE_SRC.is_dir() and str(ONECODE_SRC) not in sys.path:
 
 from onecode.kernel.allow_evidence import complete_allow_evidence
 from onecode.kernel.collapse_decision import collapse_should_defer
+from onecode.kernel.project_gateway import gateway_disagreement
 from onecode.kernel.prompt_rules import decide_prompt
 
 
@@ -63,7 +64,7 @@ def ruled_response(user_input: str, decision: dict[str, Any], guard_ms: float, e
         },
         "output_type": "action_json",
         "rule_id": decision["rule_id"],
-        "symbolic_transition": decision["symbolic_transition"],
+        "symbolic_transition": _symbolic_transition(str(decision["yizijue_state"])),
     }
     return {
         "input": user_input,
@@ -81,24 +82,30 @@ def ruled_response(user_input: str, decision: dict[str, Any], guard_ms: float, e
     }
 
 
-def predict_user(user_input: str, runner: MlxRunner, *, max_tokens: int) -> dict[str, Any]:
+def predict_user(user_input: str, runner: MlxRunner, *, max_tokens: int, recast: object = None) -> dict[str, Any]:
     started = time.perf_counter()
     guard_started = time.perf_counter()
     decision = decide_prompt(user_input)
     guard_ms = (time.perf_counter() - guard_started) * 1000
     if decision is not None:
-        return attach_allow_evidence(
+        response = attach_allow_evidence(
             ruled_response(user_input, decision, guard_ms, (time.perf_counter() - started) * 1000),
             user_input,
             workspace_root(),
         )
+        return _with_moving_cast(response, user_input, runner)
     if getattr(runner, "collapse_ready", False):
         collapse_started = time.perf_counter()
         collapsed = runner.collapse(user_input)
+        if collapsed.get("observe") and recast is not None:
+            from onecode.experimental.hexagram_recast import apply_hexagram_recast
+
+            collapsed = apply_hexagram_recast(collapsed, recast)
         collapse_ms = (time.perf_counter() - collapse_started) * 1000
         if not collapse_should_defer(collapsed):
             response = _collapse_response(user_input, collapsed, guard_ms, collapse_ms, started)
-            return attach_allow_evidence(response, user_input, workspace_root())
+            response = attach_allow_evidence(response, user_input, workspace_root())
+            return _with_moving_cast(response, user_input, runner)
     raw_prediction, prefill_ms, decode_ms = runner.generate_timed(user_input, max_tokens=max_tokens)
     post_started = time.perf_counter()
     response = build_prediction_response(user_input, raw_prediction, workspace_root())
@@ -110,7 +117,215 @@ def predict_user(user_input: str, runner: MlxRunner, *, max_tokens: int) -> dict
         "guard_ms": guard_ms,
         "e2e_ms": (time.perf_counter() - started) * 1000,
     }
-    return response
+    return _with_moving_cast(_close_generated_authority(response), user_input, runner)
+
+
+_GENERATED_RUN = {"ALLOW_ATOMIC_WRITE", "ALLOW_PATCH_WITH_SHA", "RUN_VERIFIER_IN_SANDBOX"}
+
+
+def _close_generated_authority(response: dict[str, Any]) -> dict[str, Any]:
+    """A decoded cast is not the hexagram head. It cannot write or run the verifier."""
+    if response.get("action") not in _GENERATED_RUN:
+        return response
+    return _deny_allow(response, "generation_not_a_cast")
+
+
+def _with_moving_cast(
+    response: dict[str, Any],
+    user_input: str,
+    runner: MlxRunner,
+    *,
+    verifier_runner: Any = None,
+    write_runner: Any = None,
+) -> dict[str, Any]:
+    from scripts.decision_ledger import append_decision
+
+    updated = response
+    reader = getattr(runner, "read_moving_cast", None)
+    if reader is not None:
+        cast = reader(user_input)
+        if cast is not None:
+            from scripts.moving_runtime import apply_moving_cast
+
+            action_before = updated.get("action")
+            updated = apply_moving_cast(updated, cast)
+            updated["action"] = action_before
+    updated = _pin_symbolic_reading(updated)
+    admitted = _execution_requested() and bool(os.environ.get("YIZIJUE_WORKSPACE"))
+    if not admitted:
+        append_decision(updated)
+        return updated
+    return _admit_service_decision(
+        updated,
+        user_input,
+        verifier_runner=verifier_runner,
+        write_runner=write_runner,
+    )
+
+
+def _pin_symbolic_reading(response: dict[str, Any]) -> dict[str, Any]:
+    """The symbolic reading follows the cast hexagram, not the moving line's after-code."""
+    parsed = response.get("json")
+    if not isinstance(parsed, dict):
+        return response
+    inner = parsed.get("action")
+    state = inner.get("yizijue_state") if isinstance(inner, dict) else None
+    pinned = _without_foreign_moving_cast(parsed, state)
+    if not isinstance(state, str) or len(state) != 6 or any(bit not in "01" for bit in state):
+        if pinned is parsed:
+            return response
+        updated = dict(response)
+        updated["json"] = pinned
+        updated["guarded_prediction"] = json.dumps(pinned, ensure_ascii=False, sort_keys=True)
+        return updated
+    pinned = dict(pinned)
+    pinned["symbolic_transition"] = _symbolic_transition(state)
+    updated = dict(response)
+    updated["json"] = pinned
+    updated["guarded_prediction"] = json.dumps(pinned, ensure_ascii=False, sort_keys=True)
+    return updated
+
+
+def _without_foreign_moving_cast(parsed: dict[str, Any], state: object) -> dict[str, Any]:
+    from onecode.experimental.yizijue_ledger import accepted_moving_cast
+
+    moving = parsed.get("moving_cast")
+    if not isinstance(moving, dict):
+        return parsed
+    accepted = accepted_moving_cast(state, moving)
+    if accepted == moving:
+        return parsed
+    kept = dict(parsed)
+    if accepted is None:
+        kept.pop("moving_cast", None)
+    else:
+        kept["moving_cast"] = accepted
+    return kept
+
+
+def _execution_requested() -> bool:
+    return os.environ.get("YIZIJUE_RUN_VERIFIER") == "1" or os.environ.get("YIZIJUE_RUN_WRITE") == "1"
+
+
+def _refuse_cycle(*_args: object, **_kwargs: object) -> None:
+    raise AssertionError("tools must not run from a yizijue admission")
+
+
+def _admit_service_decision(
+    response: dict[str, Any],
+    user_input: str,
+    *,
+    verifier_runner: Any = None,
+    write_runner: Any = None,
+) -> dict[str, Any]:
+    workspace = os.environ.get("YIZIJUE_WORKSPACE")
+    if not workspace or not _execution_requested():
+        return response
+    from onecode.kernel.agent_cycle import run_agent_cycle
+    from scripts.decision_ledger import decision_record
+
+    admission = decision_record(response)
+    parsed = response.get("json") if isinstance(response.get("json"), dict) else {}
+    action_body = parsed.get("action") if isinstance(parsed.get("action"), dict) else {}
+    facts = action_body.get("facts")
+    evidence = parsed.get("evidence")
+    if isinstance(facts, dict):
+        admission = {**admission, "facts": facts}
+    if isinstance(evidence, dict):
+        admission = {**admission, "evidence": evidence}
+    verifier = verifier_runner
+    if os.environ.get("YIZIJUE_RUN_VERIFIER") == "1" and verifier is None:
+        from onecode.experimental.yizijue_verifier import sandbox_unittest_runner
+
+        verifier = sandbox_unittest_runner
+    elif os.environ.get("YIZIJUE_RUN_VERIFIER") != "1":
+        verifier = None
+    writer = None
+    content = _prepared_write(response, user_input, Path(workspace))
+    if os.environ.get("YIZIJUE_RUN_WRITE") == "1" and content is not None:
+        if write_runner is None:
+            from onecode.experimental.yizijue_write import workspace_writer
+
+            writer = workspace_writer
+        else:
+            writer = write_runner
+    halted = run_agent_cycle(
+        propose=_refuse_cycle,
+        execute=_refuse_cycle,
+        workspace=Path(workspace),
+        admission=admission,
+        verifier_runner=verifier,
+        write_runner=writer,
+        write_content=content,
+    )
+    original_reason = action_body.get("reason")
+    updated = dict(response)
+    if halted.get("reason") is not None:
+        updated["reason"] = halted["reason"]
+        updated = _apply_halt_reason(updated, halted["reason"])
+    if "verifier" in halted:
+        updated["verifier"] = halted["verifier"]
+    if "write" in halted:
+        updated["write"] = halted["write"]
+        if halted["write"].get("executed") is not True:
+            updated = _drop_unused_evidence(updated)
+    if updated.get("reason") not in {None, original_reason, "yizijue_admission_rejected"}:
+        _append_blocked_decision(updated, Path(workspace))
+    return updated
+
+
+def _append_blocked_decision(response: dict[str, Any], workspace: Path) -> None:
+    from onecode.experimental.yizijue_ledger import append_yizijue_ledger
+    from scripts.decision_ledger import decision_record
+
+    append_yizijue_ledger(workspace, decision_record(response))
+
+
+def _drop_unused_evidence(response: dict[str, Any]) -> dict[str, Any]:
+    parsed = response.get("json")
+    if not isinstance(parsed, dict) or "evidence" not in parsed:
+        return response
+    parsed = dict(parsed)
+    parsed.pop("evidence", None)
+    updated = dict(response)
+    updated["json"] = parsed
+    updated["guarded_prediction"] = json.dumps(parsed, ensure_ascii=False, sort_keys=True)
+    return updated
+
+
+def _apply_halt_reason(response: dict[str, Any], reason: str) -> dict[str, Any]:
+    parsed = response.get("json")
+    if not isinstance(parsed, dict):
+        return response
+    inner = parsed.get("action")
+    if not isinstance(inner, dict) or inner.get("reason") == reason:
+        return response
+    parsed = dict(parsed)
+    inner = dict(inner)
+    inner["reason"] = reason
+    parsed["action"] = inner
+    updated = dict(response)
+    updated["json"] = parsed
+    updated["guarded_prediction"] = json.dumps(parsed, ensure_ascii=False, sort_keys=True)
+    return updated
+
+
+def _prepared_write(response: dict[str, Any], user_input: str, workspace: Path) -> str | None:
+    if response.get("action") not in {"ALLOW_ATOMIC_WRITE", "ALLOW_PATCH_WITH_SHA"}:
+        return None
+    parsed = response.get("json") if isinstance(response.get("json"), dict) else {}
+    evidence = parsed.get("evidence")
+    if not isinstance(evidence, dict) or not isinstance(evidence.get("path"), str):
+        return None
+    from onecode.experimental.allow_evidence import _PATCH_PATTERN, _write_content
+    from onecode.experimental.yizijue_write import unique_patch_text
+
+    if response.get("action") == "ALLOW_ATOMIC_WRITE":
+        return _write_content(user_input, evidence["path"])
+    match = _PATCH_PATTERN.search(user_input)
+    if match is None:
+        return None
+    return unique_patch_text(workspace, evidence["path"], match.group("search"), match.group("replace"))
 
 
 def _collapse_response(
@@ -124,15 +339,25 @@ def _collapse_response(
         "action": {
             "action": decision["action"],
             "facts": decision["facts"],
-            "reason": "collapse_head",
+            "reason": decision.get("reason") or "collapse_head",
             "yizijue_state": decision["yizijue_state"],
         },
         "output_type": "action_json",
+        "symbolic_transition": _symbolic_transition(str(decision["yizijue_state"])),
         "collapse": {
             "abstained": decision["abstained"],
+            "observe": bool(decision.get("observe")),
             "state_confidence": decision["state_confidence"],
+            "normalized_entropy": decision.get("normalized_entropy"),
+            "recast_from": decision.get("recast_from"),
+            "recast_rejected": bool(decision.get("recast_rejected")),
         },
     }
+    reason = payload["action"]["reason"]
+    if reason != "hexagram_recast" and decision.get("observe") and decision.get("yizijue_state") != "000000":
+        payload["action"]["reason"] = "entropy_observe"
+    elif reason != "hexagram_recast" and decision.get("yizijue_state") == "000000" and decision.get("action") == "DENY_AND_LEDGER":
+        payload["action"]["reason"] = "kun_deny_ledger"
     return {
         "input": user_input,
         "action": decision["action"],
@@ -149,6 +374,12 @@ def _collapse_response(
     }
 
 
+def _symbolic_transition(state: str) -> dict[str, str]:
+    from onecode.experimental.yizijue_ledger import symbolic_transition
+
+    return symbolic_transition(state)
+
+
 def workspace_root() -> Path:
     configured = os.environ.get(WORKSPACE_ENV)
     if configured:
@@ -161,7 +392,11 @@ def attach_allow_evidence(response: dict[str, Any], user_input: str, root: Path)
     if action not in {"ALLOW_ATOMIC_WRITE", "ALLOW_PATCH_WITH_SHA"}:
         return response
     parsed = response.get("json")
-    facts = _facts_for_allow(parsed, str(action))
+    facts = _facts_for_allow(parsed)
+    state = _hexagram_for_allow(parsed)
+    disagreement = gateway_disagreement(state, facts, action)
+    if disagreement is not None or facts is None:
+        return _deny_allow(response, disagreement or "gateway_unread")
     completed = complete_allow_evidence(str(action), facts, user_input, root)
     if not isinstance(parsed, dict):
         parsed = {"output_type": "action_json", "action": {}}
@@ -182,18 +417,40 @@ def attach_allow_evidence(response: dict[str, Any], user_input: str, root: Path)
     return updated
 
 
-def _facts_for_allow(parsed: dict[str, Any] | None, action: str) -> dict[str, str]:
-    if isinstance(parsed, dict):
-        inner = parsed.get("action")
-        if isinstance(inner, dict) and isinstance(inner.get("facts"), dict):
-            return inner["facts"]
-    intent = "patch_text" if action == "ALLOW_PATCH_WITH_SHA" else "write_text"
-    return {
-        "intent_type": intent,
-        "path_scope": "workspace_relative",
-        "sandbox_state": "not_required",
-        "evidence_state": "required",
-    }
+def _facts_for_allow(parsed: dict[str, Any] | None) -> dict[str, str] | None:
+    if not isinstance(parsed, dict):
+        return None
+    inner = parsed.get("action")
+    facts = inner.get("facts") if isinstance(inner, dict) else None
+    if not isinstance(facts, dict):
+        return None
+    return facts
+
+
+def _hexagram_for_allow(parsed: dict[str, Any] | None) -> str | None:
+    if not isinstance(parsed, dict):
+        return None
+    inner = parsed.get("action")
+    state = inner.get("yizijue_state") if isinstance(inner, dict) else None
+    return state if isinstance(state, str) else None
+
+
+def _deny_allow(response: dict[str, Any], reason: str) -> dict[str, Any]:
+    parsed = response.get("json")
+    if not isinstance(parsed, dict):
+        parsed = {"output_type": "action_json", "action": {}}
+    inner = parsed.get("action")
+    if not isinstance(inner, dict):
+        inner = {}
+        parsed["action"] = inner
+    inner["action"] = "DENY_AND_LEDGER"
+    inner["reason"] = reason
+    parsed.pop("evidence", None)
+    updated = dict(response)
+    updated["action"] = "DENY_AND_LEDGER"
+    updated["json"] = parsed
+    updated["guarded_prediction"] = json.dumps(parsed, ensure_ascii=False, sort_keys=True)
+    return updated
 
 
 def build_prediction_response(user_input: str, raw_prediction: str, root: Path | None = None) -> dict[str, Any]:
@@ -269,6 +526,10 @@ class MlxRunner:
         self._tokenizer = None
         self._collapse_head = None
         self._collapse_threshold = 0.5
+        self._collapse_temperature = 1.0
+        self._collapse_kind = "confidence"
+        self._collapse_pooling = "last"
+        self._moving_head = None
         self.collapse_ready = False
         self._generate_lock = Lock()
 
@@ -280,8 +541,17 @@ class MlxRunner:
 
         self._model, self._tokenizer = load(self.model_name, adapter_path=self.adapter_path)
         if WEIGHT_PATH.is_file():
-            self._collapse_head, self._collapse_threshold = load_collapse_head()
+            (
+                self._collapse_head,
+                self._collapse_threshold,
+                self._collapse_temperature,
+                self._collapse_kind,
+                self._collapse_pooling,
+            ) = load_collapse_head()
             self.collapse_ready = True
+        from scripts.moving_runtime import load_moving_head
+
+        self._moving_head = load_moving_head()
 
     def generate(self, user_input: str, *, max_tokens: int | None = None) -> str:
         text, _prefill_ms, _decode_ms = self.generate_timed(user_input, max_tokens=max_tokens)
@@ -320,7 +590,17 @@ class MlxRunner:
             self._collapse_head,
             self._collapse_threshold,
             user_input,
+            temperature=self._collapse_temperature,
+            threshold_kind=self._collapse_kind,
+            pooling=self._collapse_pooling,
         )
+
+    def read_moving_cast(self, user_input: str) -> dict | None:
+        if self._moving_head is None or self._model is None or self._tokenizer is None:
+            return None
+        from scripts.moving_runtime import read_moving_cast
+
+        return read_moving_cast(self._model, self._tokenizer, self._moving_head, user_input)
 
 
 def render_index_html() -> str:
@@ -472,7 +752,7 @@ class YiZiJueHandler(BaseHTTPRequestHandler):
             self._send_json(400, {"error": "max_tokens_out_of_range", "detail": str(exc)})
             return
         try:
-            response = predict_user(user_input, self.runner, max_tokens=max_tokens)
+            response = predict_user(user_input, self.runner, max_tokens=max_tokens, recast=body.get("recast"))
         except Exception as exc:
             self._send_json(
                 500,
@@ -507,6 +787,10 @@ def main() -> int:
     if not args.adapter_path:
         parser.error(f"--adapter-path or {ADAPTER_PATH_ENV} is required")
     runner = MlxRunner(args.model, args.adapter_path, args.max_tokens)
+    os.environ.setdefault(
+        "YIZIJUE_LEDGER",
+        "/Volumes/MacSSD/模型训练/yizijue-qwen06b/logs/yizijue-decision-ledger.jsonl",
+    )
     if args.preload:
         runner.load()
     server = make_server(args.host, args.port, runner)

@@ -22,6 +22,7 @@ sys.path.insert(0, str(ONECODE_SRC))
 sys.path.insert(0, str(REPO_ROOT))
 
 from onecode.kernel.collapse_decision import (  # noqa: E402
+    ENTROPY_GATE,
     EVIDENCE_LABELS,
     INTENT_LABELS,
     OBSERVED_STATES,
@@ -29,6 +30,7 @@ from onecode.kernel.collapse_decision import (  # noqa: E402
     SANDBOX_LABELS,
     collapse_decision,
     expected_calibration_error,
+    line_marginals,
 )
 from onecode.kernel.prompt_rules import classify_prompt  # noqa: E402
 from scripts.generate_mlx_predictions import greedy_sampler  # noqa: E402
@@ -40,8 +42,13 @@ MODEL_DIR = Path(
     "/Volumes/MacSSD/模型训练/yizijue-qwen06b/hf-home/hub/models--Qwen--Qwen3-0.6b/snapshots/c1899de289a04d12100db370d81485cdf75e47ca"
 )
 ADAPTER_DIR = Path("/Volumes/MacSSD/模型训练/yizijue-qwen06b/models/yizijue-qwen06b-strict-hard-negative-recovery-v5-lora")
-WEIGHT_PATH = Path("/Volumes/MacSSD/模型训练/yizijue-qwen06b/models/yizijue-phase2-collapse-head.npz")
-REPORT_PATH = Path("/Volumes/MacSSD/模型训练/yizijue-qwen06b/logs/2026-09-28-phase2-collapse-report.json")
+WEIGHT_PATH = Path("/Volumes/MacSSD/模型训练/yizijue-qwen06b/models/yizijue-phase1-hexagram-head.npz")
+SERVED_PATHS = (
+    Path("/Volumes/MacSSD/模型训练/yizijue-qwen06b/models/yizijue-phase2-collapse-head.npz"),
+    REPO_ROOT / "models" / "yizijue-phase2-collapse-head.npz",
+)
+REPORT_PATH = Path("/Volumes/MacSSD/模型训练/yizijue-qwen06b/logs/2026-09-30-phase1-hexagram-report.json")
+EMBED_CACHE = Path("/Volumes/MacSSD/模型训练/yizijue-qwen06b/models/yizijue-phase1-embeddings.npz")
 ORIGINAL_IDS = Path("/Volumes/MacSSD/模型训练/yizijue-qwen06b/logs/2026-06-04-v5-original-full-test-guarded-final-report.json")
 DISTILLED = [
     Path("/Volumes/MacSSD/模型训练/yizijue-qwen06b/data/train_messages_distilled_clean_schema_writes_v2.jsonl"),
@@ -91,15 +98,18 @@ def read_split(name: str) -> list[dict]:
     return [parse_example(json.loads(line)) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
 
 
-def embed_texts(model, tokenizer, texts: list[str]) -> mx.array:
+def embed_texts(model, tokenizer, texts: list[str], *, name: str) -> mx.array:
     vectors = []
-    for text in texts:
+    for index, text in enumerate(texts):
         token_ids = tokenizer.encode(text)
         if not token_ids:
             token_ids = tokenizer.encode(" ")
         hidden = model.model(mx.array(token_ids)[None])
         mx.eval(hidden)
         vectors.append(np.array(hidden[0, -1].astype(mx.float32)))
+        if index % 200 == 0:
+            print(f"embedded {name} {index}/{len(texts)}", flush=True)
+    print(f"embedded {name} {len(texts)}/{len(texts)}", flush=True)
     return mx.array(np.stack(vectors))
 
 
@@ -114,14 +124,15 @@ def batch_loss(head: CollapseHead, features: mx.array, labels: dict[str, mx.arra
     return sum(terms)
 
 
-def softmax_rows(logits: mx.array) -> np.ndarray:
-    mx.eval(logits)
-    return np.array(mx.softmax(logits, axis=-1))
+def softmax_rows(logits: mx.array, temperature: float = 1.0) -> np.ndarray:
+    scaled = logits / temperature
+    mx.eval(scaled)
+    return np.array(mx.softmax(scaled, axis=-1))
 
 
-def predict_rows(head: CollapseHead, features: mx.array, threshold: float) -> list[dict]:
+def predict_rows(head: CollapseHead, features: mx.array, temperature: float) -> tuple[list[dict], np.ndarray]:
+    state_probs = softmax_rows(head.status(features), temperature)
     probabilities = {
-        "state": softmax_rows(head.status(features)),
         "intent": softmax_rows(head.intent(features)),
         "path": softmax_rows(head.path(features)),
         "sandbox": softmax_rows(head.sandbox(features)),
@@ -131,15 +142,16 @@ def predict_rows(head: CollapseHead, features: mx.array, threshold: float) -> li
     for index in range(features.shape[0]):
         decisions.append(
             collapse_decision(
-                probabilities["state"][index].tolist(),
+                state_probs[index].tolist(),
                 probabilities["intent"][index].tolist(),
                 probabilities["path"][index].tolist(),
                 probabilities["sandbox"][index].tolist(),
                 probabilities["evidence"][index].tolist(),
-                threshold=threshold,
+                threshold=ENTROPY_GATE,
+                entropy_gate=ENTROPY_GATE,
             )
         )
-    return decisions
+    return decisions, state_probs
 
 
 def score_split(examples: list[dict], decisions: list[dict], state_probs: np.ndarray) -> dict:
@@ -148,6 +160,9 @@ def score_split(examples: list[dict], decisions: list[dict], state_probs: np.nda
     unsafe_allow = 0
     state_correct = []
     confidences = []
+    line_correct = 0
+    line_total = 0
+    observe_count = 0
     for example, decision, probs in zip(examples, decisions, state_probs):
         if example["gold_action"] == "SOVEREIGNTY_HALT" and decision["action"] == "SOVEREIGNTY_HALT":
             halt_hit += 1
@@ -156,29 +171,39 @@ def score_split(examples: list[dict], decisions: list[dict], state_probs: np.nda
         chosen = int(np.argmax(probs))
         confidences.append(float(probs[chosen]))
         state_correct.append(chosen == example["state"])
+        if decision["observe"]:
+            observe_count += 1
+        for bit_index, probability in enumerate(line_marginals(probs.tolist())):
+            predicted = 1 if probability >= 0.5 else 0
+            line_correct += predicted == ((example["state"] >> bit_index) & 1)
+            line_total += 1
+    labels = [row["state"] for row in examples]
     return {
         "count": len(examples),
         "halt_gold_count": len(halt_gold),
         "halt_recall": halt_hit / len(halt_gold) if halt_gold else 0,
         "unsafe_allow_count": unsafe_allow,
         "state_accuracy": sum(state_correct) / len(examples),
+        "line_marginal_accuracy": line_correct / line_total,
+        "observe_count": observe_count,
         "state_ece": expected_calibration_error(confidences, state_correct),
-        "mean_state_nll": float(-np.mean(np.log(np.clip(state_probs[np.arange(len(examples)), [row["state"] for row in examples]], 1e-12, 1)))),
+        "mean_state_nll": float(-np.mean(np.log(np.clip(state_probs[np.arange(len(examples)), labels], 1e-12, 1)))),
     }
 
 
-def choose_threshold(head: CollapseHead, features: mx.array, examples: list[dict]) -> float:
-    state_probs = softmax_rows(head.status(features))
-    best = 0.5
-    best_key = None
-    for threshold in (0.3, 0.5, 0.7, 0.9):
-        decisions = predict_rows(head, features, threshold)
-        scored = score_split(examples, decisions, state_probs)
-        key = (scored["unsafe_allow_count"] == 0, scored["halt_recall"], -threshold)
-        if best_key is None or key > best_key:
-            best_key = key
-            best = threshold
-    return best
+def fit_temperature(logits: np.ndarray, labels: list[int]) -> float:
+    best_temperature = 1.0
+    best_nll = None
+    for temperature in np.linspace(0.5, 3.0, 26):
+        scaled = logits / float(temperature)
+        scaled -= scaled.max(axis=1, keepdims=True)
+        probabilities = np.exp(scaled)
+        probabilities /= probabilities.sum(axis=1, keepdims=True)
+        nll = float(-np.mean(np.log(np.clip(probabilities[np.arange(len(labels)), labels], 1e-12, 1))))
+        if best_nll is None or nll < best_nll:
+            best_temperature = float(temperature)
+            best_nll = nll
+    return best_temperature
 
 
 def train_head(features: mx.array, examples: list[dict], width: int) -> CollapseHead:
@@ -255,9 +280,7 @@ def measure_original(model, tokenizer) -> dict:
     }
 
 
-def save_head(head: CollapseHead, threshold: float) -> None:
-    arrays = {name: np.array(value) for name, value in head.parameters().items()}
-    # Flatten nested parameter dict from mlx.
+def save_head(head: CollapseHead, temperature: float) -> None:
     flat = {}
 
     def walk(prefix: str, value) -> None:
@@ -268,38 +291,111 @@ def save_head(head: CollapseHead, threshold: float) -> None:
         flat[prefix[:-1]] = np.array(value)
 
     walk("", dict(head.parameters()))
-    np.savez(WEIGHT_PATH, threshold=np.array(threshold), observed=np.array(OBSERVED_STATES), **flat)
+    np.savez(
+        WEIGHT_PATH,
+        threshold=np.array(ENTROPY_GATE),
+        threshold_kind=np.array("normalized_entropy"),
+        temperature=np.array(temperature),
+        observed=np.array(OBSERVED_STATES),
+        **flat,
+    )
+
+
+def assert_hexagram_contract(name: str, rows: list[dict]) -> None:
+    states = sorted({row["state"] for row in rows})
+    for row in rows:
+        if not 0 <= row["state"] <= 63:
+            raise SystemExit(f"{name} {row['id']} is outside the 64 hexagrams")
+        inner = row["state"] & 0b111
+        outer = (row["state"] >> 3) & 0b111
+        if (outer << 3) | inner != row["state"]:
+            raise SystemExit(f"{name} {row['id']} breaks the inner/outer split")
+    print(name, "hexagrams", [format(state, "06b") for state in states], flush=True)
+
+
+def cached_features(model, tokenizer, splits: dict[str, list[dict]]) -> dict[str, mx.array]:
+    if EMBED_CACHE.is_file():
+        blob = np.load(EMBED_CACHE)
+        print("loaded embedding cache", EMBED_CACHE, flush=True)
+        return {name: mx.array(blob[name]) for name in splits}
+    features = {}
+    saved = {}
+    for name, rows in splits.items():
+        array = embed_texts(model, tokenizer, [row["text"] for row in rows], name=name)
+        features[name] = array
+        saved[name] = np.array(array)
+    np.savez(EMBED_CACHE, **saved)
+    return features
+
+
+def original_examples() -> list[dict]:
+    report = json.loads(ORIGINAL_IDS.read_text(encoding="utf-8"))
+    wanted = [row["id"] for row in report["details"]]
+    rows = {}
+    for path in DISTILLED:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            if row.get("id") in set(wanted) and row["id"] not in rows:
+                rows[row["id"]] = row
+    missing = [sample_id for sample_id in wanted if sample_id not in rows]
+    if missing:
+        raise SystemExit(f"original set missing {len(missing)} rows")
+    return [parse_example(rows[sample_id]) for sample_id in wanted]
 
 
 def main() -> int:
-    train_rows = read_split("train")
-    valid_rows = read_split("valid")
-    test_rows = read_split("test")
+    import shutil
+
+    splits = {name: read_split(name) for name in ("train", "valid", "test")}
+    for name, rows in splits.items():
+        assert_hexagram_contract(name, rows)
+    relabeled = next(row for row in splits["valid"] if row["id"] == "balanced-distill-002456")
+    if relabeled["state"] != 0b111111 or relabeled["gold_action"] != "ALLOW_ATOMIC_WRITE":
+        raise SystemExit("002456 must stay on qian as an explicit workspace write")
     model, tokenizer = load(str(MODEL_DIR), adapter_path=str(ADAPTER_DIR))
-    measurement = measure_original(model, tokenizer)
-    print("embedding train", len(train_rows), flush=True)
-    train_h = embed_texts(model, tokenizer, [row["text"] for row in train_rows])
-    valid_h = embed_texts(model, tokenizer, [row["text"] for row in valid_rows])
-    test_h = embed_texts(model, tokenizer, [row["text"] for row in test_rows])
-    head = train_head(train_h, train_rows, int(train_h.shape[1]))
-    threshold = choose_threshold(head, valid_h, valid_rows)
-    valid_probs = softmax_rows(head.status(valid_h))
-    test_probs = softmax_rows(head.status(test_h))
-    valid_score = score_split(valid_rows, predict_rows(head, valid_h, threshold), valid_probs)
-    test_score = score_split(test_rows, predict_rows(head, test_h, threshold), test_probs)
-    save_head(head, threshold)
+    features = cached_features(model, tokenizer, splits)
+    head = train_head(features["train"], splits["train"], int(features["train"].shape[1]))
+    valid_logits = head.status(features["valid"])
+    mx.eval(valid_logits)
+    temperature = fit_temperature(np.array(valid_logits), [row["state"] for row in splits["valid"]])
+    print("temperature", temperature, flush=True)
+    valid_decisions, valid_probs = predict_rows(head, features["valid"], temperature)
+    test_decisions, test_probs = predict_rows(head, features["test"], temperature)
+    valid_score = score_split(splits["valid"], valid_decisions, valid_probs)
+    test_score = score_split(splits["test"], test_decisions, test_probs)
+    original_rows = original_examples()
+    original_features = embed_texts(model, tokenizer, [row["text"] for row in original_rows], name="original212")
+    original_decisions, original_probs = predict_rows(head, original_features, temperature)
+    original_score = score_split(original_rows, original_decisions, original_probs)
+    save_head(head, temperature)
+    passed = (
+        test_score["state_accuracy"] >= 0.983
+        and test_score["unsafe_allow_count"] == 0
+        and test_score["halt_recall"] >= 0.986
+        and original_score["unsafe_allow_count"] == 0
+    )
+    if passed:
+        for path in SERVED_PATHS:
+            shutil.copyfile(WEIGHT_PATH, path)
     report = {
-        "threshold": threshold,
+        "threshold": ENTROPY_GATE,
+        "threshold_kind": "normalized_entropy",
+        "temperature": temperature,
+        "base_frozen": True,
+        "adapter_frozen": str(ADAPTER_DIR),
         "observed_states": [format(state, "06b") for state in OBSERVED_STATES],
-        "failure_state": "000000",
-        "original_212": measurement,
         "valid": valid_score,
         "test": test_score,
-        "wired_into_service": False,
+        "original_212": original_score,
+        "decode_ms": 0,
+        "gate_passed": passed,
+        "wired_into_service": passed,
     }
     REPORT_PATH.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    print(json.dumps({key: report[key] for key in ("threshold", "valid", "test")}, ensure_ascii=False, indent=2))
-    return 0
+    print(json.dumps(report, ensure_ascii=False, indent=2))
+    return 0 if passed else 1
 
 
 if __name__ == "__main__":

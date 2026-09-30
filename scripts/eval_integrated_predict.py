@@ -60,14 +60,23 @@ def original_rows() -> list[dict]:
     return [found[item] for item in wanted]
 
 
-def decide_row(text: str, model, tokenizer, head, threshold: float, workspace: Path) -> dict:
+def decide_row(text: str, model, tokenizer, head, threshold: float, workspace: Path, *, temperature: float = 1.0, threshold_kind: str = "confidence", pooling: str = "last") -> dict:
     rule = classify_prompt(text)
     if rule is not None:
         decided = decide_prompt(text)
         proposal = str(decided["action"])
         final, reason = _apply_evidence(proposal, decided["facts"], text, workspace)
         return {"source": rule.family, "proposal": proposal, "final": final, "reason": reason, "skipped_generation": True}
-    collapsed = collapse_text(model, tokenizer, head, threshold, text)
+    collapsed = collapse_text(
+        model,
+        tokenizer,
+        head,
+        threshold,
+        text,
+        temperature=temperature,
+        threshold_kind=threshold_kind,
+        pooling=pooling,
+    )
     if collapse_should_defer(collapsed):
         return {"source": "would_generate", "proposal": None, "final": None, "reason": None, "skipped_generation": False}
     proposal = str(collapsed["action"])
@@ -132,7 +141,7 @@ def summarize(rows: list[dict], scored: list[dict]) -> dict:
 
 def main() -> int:
     model, tokenizer = load(str(MODEL_DIR), adapter_path=str(ADAPTER_DIR))
-    head, threshold = load_collapse_head()
+    head, threshold, temperature, threshold_kind, pooling = load_collapse_head()
     sets = {
         "v5_test": read_jsonl(V5_TEST),
         "original_212": original_rows(),
@@ -142,7 +151,20 @@ def main() -> int:
     with tempfile.TemporaryDirectory() as root:
         workspace = Path(root)
         for name, rows in sets.items():
-            scored = [decide_row(user_text(row), model, tokenizer, head, threshold, workspace) for row in rows]
+            scored = [
+                decide_row(
+                    user_text(row),
+                    model,
+                    tokenizer,
+                    head,
+                    threshold,
+                    workspace,
+                    temperature=temperature,
+                    threshold_kind=threshold_kind,
+                    pooling=pooling,
+                )
+                for row in rows
+            ]
             summary = summarize(rows, scored)
             if name == "label_conflict_002456" and rows:
                 summary["text"] = user_text(rows[0])

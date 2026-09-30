@@ -616,17 +616,18 @@ class EvalMlxPredictionsTest(unittest.TestCase):
             )
             report = json.loads(output_path.read_text(encoding="utf-8"))
 
-        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.returncode, 1)
         self.assertEqual(report["unknown_action_count"], 0)
-        self.assertEqual(report["action_match_count"], 1)
+        self.assertEqual(report["action_match_count"], 0)
+        self.assertIn("action_match_rate", result.stderr)
 
-    def test_guard_normalizes_unknown_run_actions_to_sandbox_verifier(self):
+    def test_guard_denies_unknown_run_names(self):
         guarded = guard_prediction_text('{"action":{"action":"RUN_PYTEST","reason":"run tests"}}')
         parsed = extract_first_json_object(guarded)
 
-        self.assertEqual(parsed["action"]["action"], "RUN_VERIFIER_IN_SANDBOX")
+        self.assertEqual(parsed["action"]["action"], "DENY_AND_LEDGER")
         self.assertEqual(parsed["action"]["original_action"], "RUN_PYTEST")
-        self.assertEqual(parsed["action"]["reason"], "unknown_run_action_normalized_to_sandbox_verifier")
+        self.assertEqual(parsed["action"]["reason"], "unknown_action_fail_closed")
 
     def test_guard_rewrites_unknown_allow_actions_to_deny_and_ledger(self):
         guarded = guard_prediction_text('{"action":{"action":"ALLOW_BASH_EXECUTION","reason":"run command"}}')
@@ -636,10 +637,17 @@ class EvalMlxPredictionsTest(unittest.TestCase):
         self.assertEqual(parsed["action"]["original_action"], "ALLOW_BASH_EXECUTION")
         self.assertEqual(parsed["action"]["reason"], "unknown_action_fail_closed")
 
-    def test_guard_preserves_allowed_actions(self):
-        prediction = '{"action":{"action":"RUN_VERIFIER_IN_SANDBOX","reason":"verifier_requires_sandbox"}}'
-
-        self.assertEqual(guard_prediction_text(prediction), prediction)
+    def test_guard_keeps_a_named_action_only_when_the_hexagram_projects_it(self):
+        kept = (
+            '{"action":{"action":"RUN_VERIFIER_IN_SANDBOX","facts":{"evidence_state":"required",'
+            '"intent_type":"execute_pytest","path_scope":"no_path","sandbox_state":"required"},'
+            '"reason":"verifier_requires_sandbox","yizijue_state":"010010"}}'
+        )
+        self.assertEqual(guard_prediction_text(kept), kept)
+        denied = guard_prediction_text('{"action":{"action":"RUN_VERIFIER_IN_SANDBOX","reason":"verifier_requires_sandbox"}}')
+        parsed = extract_first_json_object(denied)
+        self.assertEqual(parsed["action"]["action"], "DENY_AND_LEDGER")
+        self.assertEqual(parsed["action"]["reason"], "gateway_unread")
 
     def test_prompt_risk_guard_rewrites_dangerous_allow_to_sovereignty_halt(self):
         rows = [
